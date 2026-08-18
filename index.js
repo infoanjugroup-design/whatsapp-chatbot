@@ -1,5 +1,4 @@
 const express = require("express");
-const QRCode = require("qrcode");
 const pino = require("pino");
 const { createClient } = require("@supabase/supabase-js");
 const {
@@ -17,17 +16,24 @@ const {
 const PORT = process.env.PORT || 3000;
 const AUTO_REPLY_ENDPOINT_URL = process.env.AUTO_REPLY_ENDPOINT_URL;
 const AUTO_REPLY_SHARED_SECRET = process.env.AUTO_REPLY_SHARED_SECRET;
-const QR_ACCESS_KEY = process.env.QR_ACCESS_KEY;
+const ACCESS_KEY = process.env.QR_ACCESS_KEY || process.env.PAIR_ACCESS_KEY;
+
+// Phone number with country code (e.g., 919876543210 - no '+', no spaces)
 const PAIRING_PHONE_NUMBER = process.env.PAIRING_PHONE_NUMBER
   ? process.env.PAIRING_PHONE_NUMBER.replace(/[^\d]/g, "")
   : null;
 
-// Supabase Credentials (Render ke environment variables me dalein)
+// Supabase Credentials
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!AUTO_REPLY_ENDPOINT_URL) {
   console.error("FATAL: AUTO_REPLY_ENDPOINT_URL is not set. Refusing to start.");
+  process.exit(1);
+}
+
+if (!PAIRING_PHONE_NUMBER) {
+  console.error("FATAL: PAIRING_PHONE_NUMBER is required for phone number linking. Example: 91XXXXXXXXXX");
   process.exit(1);
 }
 
@@ -40,7 +46,6 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const logger = pino({ level: process.env.LOG_LEVEL || "info" });
 
 // ---- Shared in-memory state ----
-let latestQrString = null;
 let latestPairingCode = null;
 let connectionStatus = "starting";
 
@@ -80,7 +85,7 @@ async function useSupabaseAuthState() {
     try {
       await supabase.from("whatsapp_auth").delete().eq("id", `${type}:${id}`);
     } catch (err) {
-      logger.error({ err, type, id }, "Error deleting auth state from Supabase");
+      logger.error({ err, type, id }, "Error deleting auth data from Supabase");
     }
   };
 
@@ -122,67 +127,71 @@ async function useSupabaseAuthState() {
 }
 
 // ----------------------------------------------------------------------------
-// Express HTTP Server (Required for Render & Web UI Access)
+// Express HTTP Server
 // ----------------------------------------------------------------------------
 const app = express();
 
-app.get("/", (_req, res) => {
-  res.json({ status: connectionStatus });
-});
-
 app.get("/health", (_req, res) => {
-  res.status(connectionStatus === "connected" ? 200 : 503).json({ status: connectionStatus });
+  res.status(connectionStatus === "connected" ? 200 : 503).json({ 
+    status: connectionStatus,
+    pairedNumber: PAIRING_PHONE_NUMBER 
+  });
 });
 
-app.get("/qr", async (req, res) => {
-  if (QR_ACCESS_KEY && req.query.key !== QR_ACCESS_KEY) {
+// Main UI page showing the pairing code
+const renderPairingPage = (req, res) => {
+  if (ACCESS_KEY && req.query.key !== ACCESS_KEY) {
     return res.status(401).send("Unauthorized");
   }
   if (connectionStatus === "connected") {
-    return res.send("<h2>Already linked and connected. Nothing to scan.</h2>");
-  }
-  if (!latestQrString) {
-    return res.send("<h2>No QR yet — starting up, refresh in a few seconds.</h2>");
-  }
-  const dataUrl = await QRCode.toDataURL(latestQrString);
-  res.send(
-    `<html><body style="text-align:center;font-family:sans-serif;padding-top:40px;">
-       <h2>Scan with WhatsApp → Linked Devices → Link a Device</h2>
-       <img src="${dataUrl}" width="300" height="300" />
-       <p>Page auto-refreshes every 5 seconds.</p>
-       <script>setTimeout(() => location.reload(), 5000);</script>
-     </body></html>`
-  );
-});
-
-app.get("/pair", (req, res) => {
-  if (QR_ACCESS_KEY && req.query.key !== QR_ACCESS_KEY) {
-    return res.status(401).send("Unauthorized");
-  }
-  if (!PAIRING_PHONE_NUMBER) {
-    return res.status(400).send("PAIRING_PHONE_NUMBER is not set. Use /qr instead.");
-  }
-  if (connectionStatus === "connected") {
-    return res.send("<h2>Already linked and connected. Nothing to pair.</h2>");
+    return res.send(`
+      <html><body style="text-align:center;font-family:sans-serif;padding-top:50px;">
+        <h2 style="color:#128c7e;">✅ WhatsApp is Connected & Active!</h2>
+        <p>Your bot is listening and auto-replying.</p>
+      </body></html>
+    `);
   }
   if (!latestPairingCode) {
-    return res.send("<h2>No pairing code yet — generating, refresh in a few seconds.</h2>");
+    return res.send(`
+      <html><body style="text-align:center;font-family:sans-serif;padding-top:50px;">
+        <h2>Generating pairing code for ${PAIRING_PHONE_NUMBER}...</h2>
+        <p>Please refresh in a few seconds.</p>
+        <script>setTimeout(() => location.reload(), 3000);</script>
+      </body></html>
+    `);
   }
-  res.send(
-    `<html><body style="text-align:center;font-family:sans-serif;padding-top:40px;">
-       <h2>On your phone: WhatsApp → Linked Devices → Link a Device →<br/>"Link with phone number instead"</h2>
-       <p>Enter this code:</p>
-       <div style="font-size:2.8em;letter-spacing:0.15em;font-weight:bold;color:#128c7e;">${latestPairingCode}</div>
-       <p>Page auto-refreshes every 5 seconds.</p>
-       <script>setTimeout(() => location.reload(), 5000);</script>
-     </body></html>`
-  );
-});
+  return res.send(`
+    <html>
+      <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>WhatsApp Linking</title>
+      </head>
+      <body style="text-align:center;font-family:sans-serif;padding-top:40px;background:#f0f2f5;">
+        <div style="max-width:450px;margin:auto;background:white;padding:30px;border-radius:12px;box-shadow:0 4px 12px rgba(0,0,0,0.1);">
+          <h2 style="color:#075e54;margin-top:0;">Link WhatsApp Number</h2>
+          <p style="color:#555;font-size:15px;line-height:1.5;">
+            1. Open WhatsApp on <b>+${PAIRING_PHONE_NUMBER}</b><br/>
+            2. Tap <b>Settings</b> &rarr; <b>Linked Devices</b> &rarr; <b>Link a Device</b><br/>
+            3. Tap <b>"Link with phone number instead"</b>
+          </p>
+          <hr style="border:0;border-top:1px solid #eee;margin:20px 0;"/>
+          <p style="font-size:14px;color:#777;margin-bottom:5px;">Enter this code on your phone:</p>
+          <div style="font-size:2.6em;letter-spacing:0.2em;font-weight:bold;color:#128c7e;background:#e7f7e9;padding:15px;border-radius:8px;display:inline-block;">
+            ${latestPairingCode}
+          </div>
+          <p style="font-size:12px;color:#999;margin-top:20px;">Page auto-refreshes every 6 seconds until connected.</p>
+        </div>
+        <script>setTimeout(() => location.reload(), 6000);</script>
+      </body>
+    </html>
+  `);
+};
+
+app.get("/", renderPairingPage);
+app.get("/pair", renderPairingPage);
 
 app.listen(PORT, () => {
-  logger.info(
-    `HTTP server running on port ${PORT} (${PAIRING_PHONE_NUMBER ? "Pairing at /pair" : "QR at /qr"}, Health at /health)`
-  );
+  logger.info(`HTTP server running on port ${PORT}. Open / or /pair to view pairing code.`);
 });
 
 // ----------------------------------------------------------------------------
@@ -225,44 +234,38 @@ async function startBot() {
     version,
     auth: state,
     logger: pino({ level: "silent" }),
-    printQRInTerminal: false,
-    browser: ["Ubuntu", "Chrome", "20.0.04"],
+    printQRInTerminal: false, // QR completely disabled
+    browser: ["Ubuntu", "Chrome", "20.0.04"], // Custom client descriptor
   });
 
-  // Pairing code request (if phone number is set and device is not yet registered)
-  if (PAIRING_PHONE_NUMBER && !sock.authState.creds.registered) {
-    await delay(3000); // Allow socket connection initialization
+  // Pairing code request (runs only when device is not yet linked)
+  if (!sock.authState.creds.registered) {
+    await delay(3500); // Wait for connection handshake initiation
     try {
       const code = await sock.requestPairingCode(PAIRING_PHONE_NUMBER);
       latestPairingCode = code;
       connectionStatus = "pairing_pending";
-      logger.info(`Pairing code issued: ${code}`);
+
       console.log("\n==========================================");
-      console.log(` WhatsApp Pairing Code: ${code}`);
+      console.log(` WHATSAPP PAIRING CODE: ${code}`);
+      console.log(` Phone: +${PAIRING_PHONE_NUMBER}`);
       console.log("==========================================\n");
     } catch (err) {
-      logger.error(err, "Failed to request pairing code. Check PAIRING_PHONE_NUMBER format.");
+      logger.error(err, "Failed to generate pairing code. Please check PAIRING_PHONE_NUMBER.");
     }
   }
 
-  // Save session state updates to Supabase
   sock.ev.on("creds.update", saveCreds);
 
-  // Connection status events
   sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr && !PAIRING_PHONE_NUMBER) {
-      latestQrString = qr;
-      connectionStatus = "qr_pending";
-      logger.info("New QR generated. Visit /qr to scan.");
-    }
+    const { connection, lastDisconnect } = update;
 
     if (connection === "open") {
       connectionStatus = "connected";
-      latestQrString = null;
       latestPairingCode = null;
-      logger.info("WhatsApp connected successfully!");
+      console.log("\n==========================================");
+      console.log(" WhatsApp Linked Device Connected Successfully!");
+      console.log("==========================================\n");
     }
 
     if (connection === "close") {
@@ -271,7 +274,7 @@ async function startBot() {
       const loggedOut = statusCode === DisconnectReason.loggedOut;
 
       if (loggedOut) {
-        logger.error("WhatsApp session logged out. Clearing database auth session...");
+        logger.error("WhatsApp session unlinked/logged out. Clearing database auth...");
         await clearAuth();
         return;
       }
@@ -283,7 +286,7 @@ async function startBot() {
     }
   });
 
-  // Incoming messages handler
+  // Handle incoming messages
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
 
@@ -298,10 +301,10 @@ async function startBot() {
 }
 
 async function handleIncomingMessage(sock, msg) {
-  if (msg.key.fromMe) return; // Skip own messages
+  if (msg.key.fromMe) return; // Ignore bot's own messages
 
   const remoteJid = msg.key.remoteJid;
-  if (!remoteJid || remoteJid.endsWith("@g.us") || remoteJid === "status@broadcast") return; // Skip groups and status
+  if (!remoteJid || remoteJid.endsWith("@g.us") || remoteJid === "status@broadcast") return;
 
   const text =
     msg.message?.conversation ||
@@ -312,7 +315,7 @@ async function handleIncomingMessage(sock, msg) {
   if (!text.trim()) return;
 
   const phone = remoteJid.replace(/@s\.whatsapp\.net$/, "");
-  logger.info({ phone, text }, "Processing incoming message");
+  logger.info({ phone, text }, "Incoming WhatsApp message");
 
   const replyText = await getReply(phone, text);
 
@@ -323,7 +326,7 @@ async function handleIncomingMessage(sock, msg) {
   }
 }
 
-// Start bot process
+// Start bot
 startBot().catch((err) => {
   logger.error(err, "Fatal bot initialization error");
   process.exit(1);
