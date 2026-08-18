@@ -12,6 +12,7 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.48.1",
     "@whiskeysockets/baileys": "^6.7.9",
     "express": "^4.19.2",
     "pino": "^9.3.2",
