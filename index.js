@@ -8,8 +8,12 @@ const {
   fetchLatestBaileysVersion,
   initAuthCreds,
   BufferJSON,
+  delay,
 } = require("@whiskeysockets/baileys");
 
+// ----------------------------------------------------------------------------
+// Environment Variables
+// ----------------------------------------------------------------------------
 const PORT = process.env.PORT || 3000;
 const AUTO_REPLY_ENDPOINT_URL = process.env.AUTO_REPLY_ENDPOINT_URL;
 const AUTO_REPLY_SHARED_SECRET = process.env.AUTO_REPLY_SHARED_SECRET;
@@ -18,7 +22,8 @@ const PAIRING_PHONE_NUMBER = process.env.PAIRING_PHONE_NUMBER
   ? process.env.PAIRING_PHONE_NUMBER.replace(/[^\d]/g, "")
   : null;
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
+// Supabase Credentials (Render ke environment variables me dalein)
+const SUPABASE_URL = process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!AUTO_REPLY_ENDPOINT_URL) {
@@ -27,7 +32,7 @@ if (!AUTO_REPLY_ENDPOINT_URL) {
 }
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  console.error("FATAL: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for session storage.");
+  console.error("FATAL: SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are required for session persistence.");
   process.exit(1);
 }
 
@@ -40,7 +45,7 @@ let latestPairingCode = null;
 let connectionStatus = "starting";
 
 // ----------------------------------------------------------------------------
-// Supabase-backed Auth State for Baileys (Survives Render Restarts/Wipes)
+// Custom Supabase Auth State Adapter for Baileys
 // ----------------------------------------------------------------------------
 async function useSupabaseAuthState() {
   const readData = async (type, id) => {
@@ -54,7 +59,7 @@ async function useSupabaseAuthState() {
       if (error || !data) return null;
       return JSON.parse(JSON.stringify(data.data), BufferJSON.reviver);
     } catch (err) {
-      logger.error({ err, type, id }, "Error reading auth data from Supabase");
+      logger.error({ err, type, id }, "Error reading auth state from Supabase");
       return null;
     }
   };
@@ -67,7 +72,7 @@ async function useSupabaseAuthState() {
         data: parsed,
       });
     } catch (err) {
-      logger.error({ err, type, id }, "Error writing auth data to Supabase");
+      logger.error({ err, type, id }, "Error writing auth state to Supabase");
     }
   };
 
@@ -75,7 +80,7 @@ async function useSupabaseAuthState() {
     try {
       await supabase.from("whatsapp_auth").delete().eq("id", `${type}:${id}`);
     } catch (err) {
-      logger.error({ err, type, id }, "Error deleting auth data from Supabase");
+      logger.error({ err, type, id }, "Error deleting auth state from Supabase");
     }
   };
 
@@ -117,7 +122,7 @@ async function useSupabaseAuthState() {
 }
 
 // ----------------------------------------------------------------------------
-// Tiny HTTP server
+// Express HTTP Server (Required for Render & Web UI Access)
 // ----------------------------------------------------------------------------
 const app = express();
 
@@ -137,15 +142,15 @@ app.get("/qr", async (req, res) => {
     return res.send("<h2>Already linked and connected. Nothing to scan.</h2>");
   }
   if (!latestQrString) {
-    return res.send("<h2>No QR yet — still starting up, refresh in a few seconds.</h2>");
+    return res.send("<h2>No QR yet — starting up, refresh in a few seconds.</h2>");
   }
   const dataUrl = await QRCode.toDataURL(latestQrString);
   res.send(
-    `<html><body style="text-align:center;font-family:sans-serif">
+    `<html><body style="text-align:center;font-family:sans-serif;padding-top:40px;">
        <h2>Scan with WhatsApp → Linked Devices → Link a Device</h2>
        <img src="${dataUrl}" width="300" height="300" />
-       <p>This page auto-refreshes every 5s until scanned.</p>
-       <script>setTimeout(()=>location.reload(), 5000)</script>
+       <p>Page auto-refreshes every 5 seconds.</p>
+       <script>setTimeout(() => location.reload(), 5000);</script>
      </body></html>`
   );
 });
@@ -155,59 +160,62 @@ app.get("/pair", (req, res) => {
     return res.status(401).send("Unauthorized");
   }
   if (!PAIRING_PHONE_NUMBER) {
-    return res
-      .status(400)
-      .send("PAIRING_PHONE_NUMBER is not set — this service is using the QR flow instead. See /qr.");
+    return res.status(400).send("PAIRING_PHONE_NUMBER is not set. Use /qr instead.");
   }
   if (connectionStatus === "connected") {
     return res.send("<h2>Already linked and connected. Nothing to pair.</h2>");
   }
   if (!latestPairingCode) {
-    return res.send("<h2>No pairing code yet — still starting up, refresh in a few seconds.</h2>");
+    return res.send("<h2>No pairing code yet — generating, refresh in a few seconds.</h2>");
   }
   res.send(
-    `<html><body style="text-align:center;font-family:sans-serif">
+    `<html><body style="text-align:center;font-family:sans-serif;padding-top:40px;">
        <h2>On your phone: WhatsApp → Linked Devices → Link a Device →<br/>"Link with phone number instead"</h2>
        <p>Enter this code:</p>
-       <div style="font-size:2.5em;letter-spacing:0.15em;font-weight:bold">${latestPairingCode}</div>
-       <p>This page auto-refreshes every 5s until linked.</p>
-       <script>setTimeout(()=>location.reload(), 5000)</script>
+       <div style="font-size:2.8em;letter-spacing:0.15em;font-weight:bold;color:#128c7e;">${latestPairingCode}</div>
+       <p>Page auto-refreshes every 5 seconds.</p>
+       <script>setTimeout(() => location.reload(), 5000);</script>
      </body></html>`
   );
 });
 
 app.listen(PORT, () => {
   logger.info(
-    `HTTP server listening on ${PORT} (${PAIRING_PHONE_NUMBER ? "pairing code at /pair" : "QR at /qr"}, health at /health)`
+    `HTTP server running on port ${PORT} (${PAIRING_PHONE_NUMBER ? "Pairing at /pair" : "QR at /qr"}, Health at /health)`
   );
 });
 
 // ----------------------------------------------------------------------------
-// API Reply Handler
+// API Communication with Next.js Backend
 // ----------------------------------------------------------------------------
 async function getReply(phone, message) {
-  const url = new URL(AUTO_REPLY_ENDPOINT_URL);
-  const headers = { "Content-Type": "application/json" };
-  if (AUTO_REPLY_SHARED_SECRET) {
-    headers["x-auto-reply-key"] = AUTO_REPLY_SHARED_SECRET;
-  }
+  try {
+    const url = new URL(AUTO_REPLY_ENDPOINT_URL);
+    const headers = { "Content-Type": "application/json" };
+    if (AUTO_REPLY_SHARED_SECRET) {
+      headers["x-auto-reply-key"] = AUTO_REPLY_SHARED_SECRET;
+    }
 
-  const response = await fetch(url.toString(), {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ phone, message }),
-  });
+    const response = await fetch(url.toString(), {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ phone, message }),
+    });
 
-  if (!response.ok) {
-    logger.error({ status: response.status }, "auto-reply endpoint returned non-OK");
+    if (!response.ok) {
+      logger.error({ status: response.status }, "Auto-reply endpoint returned non-OK status");
+      return "Sorry, something went wrong. Please try again in a moment.";
+    }
+
+    return await response.text();
+  } catch (error) {
+    logger.error(error, "Failed to call auto-reply endpoint");
     return "Sorry, something went wrong. Please try again in a moment.";
   }
-
-  return await response.text();
 }
 
 // ----------------------------------------------------------------------------
-// WhatsApp Bot Connection
+// WhatsApp Bot Main Logic
 // ----------------------------------------------------------------------------
 async function startBot() {
   const { state, saveCreds, clearAuth } = await useSupabaseAuthState();
@@ -218,35 +226,43 @@ async function startBot() {
     auth: state,
     logger: pino({ level: "silent" }),
     printQRInTerminal: false,
+    browser: ["Ubuntu", "Chrome", "20.0.04"],
   });
 
+  // Pairing code request (if phone number is set and device is not yet registered)
   if (PAIRING_PHONE_NUMBER && !sock.authState.creds.registered) {
+    await delay(3000); // Allow socket connection initialization
     try {
       const code = await sock.requestPairingCode(PAIRING_PHONE_NUMBER);
       latestPairingCode = code;
       connectionStatus = "pairing_pending";
       logger.info(`Pairing code issued: ${code}`);
+      console.log("\n==========================================");
+      console.log(` WhatsApp Pairing Code: ${code}`);
+      console.log("==========================================\n");
     } catch (err) {
-      logger.error(err, "Failed to request pairing code — check PAIRING_PHONE_NUMBER");
+      logger.error(err, "Failed to request pairing code. Check PAIRING_PHONE_NUMBER format.");
     }
   }
 
+  // Save session state updates to Supabase
   sock.ev.on("creds.update", saveCreds);
 
+  // Connection status events
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
     if (qr && !PAIRING_PHONE_NUMBER) {
       latestQrString = qr;
       connectionStatus = "qr_pending";
-      logger.info("New QR issued — open /qr to scan.");
+      logger.info("New QR generated. Visit /qr to scan.");
     }
 
     if (connection === "open") {
       connectionStatus = "connected";
       latestQrString = null;
       latestPairingCode = null;
-      logger.info("WhatsApp linked device connected successfully.");
+      logger.info("WhatsApp connected successfully!");
     }
 
     if (connection === "close") {
@@ -255,18 +271,19 @@ async function startBot() {
       const loggedOut = statusCode === DisconnectReason.loggedOut;
 
       if (loggedOut) {
-        logger.error("Session logged out from WhatsApp. Clearing auth session from database...");
+        logger.error("WhatsApp session logged out. Clearing database auth session...");
         await clearAuth();
         return;
       }
 
       logger.warn({ statusCode }, "Connection closed. Reconnecting in 5 seconds...");
       setTimeout(() => {
-        startBot().catch((err) => logger.error(err, "Reconnect attempt failed"));
+        startBot().catch((err) => logger.error(err, "Reconnect failed"));
       }, 5000);
     }
   });
 
+  // Incoming messages handler
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
     if (type !== "notify") return;
 
@@ -274,16 +291,17 @@ async function startBot() {
       try {
         await handleIncomingMessage(sock, msg);
       } catch (err) {
-        logger.error(err, "Error handling incoming message");
+        logger.error(err, "Error processing incoming message");
       }
     }
   });
 }
 
 async function handleIncomingMessage(sock, msg) {
-  if (msg.key.fromMe) return;
+  if (msg.key.fromMe) return; // Skip own messages
+
   const remoteJid = msg.key.remoteJid;
-  if (!remoteJid || remoteJid.endsWith("@g.us") || remoteJid === "status@broadcast") return;
+  if (!remoteJid || remoteJid.endsWith("@g.us") || remoteJid === "status@broadcast") return; // Skip groups and status
 
   const text =
     msg.message?.conversation ||
@@ -294,18 +312,19 @@ async function handleIncomingMessage(sock, msg) {
   if (!text.trim()) return;
 
   const phone = remoteJid.replace(/@s\.whatsapp\.net$/, "");
-  logger.info({ phone, text }, "Incoming message");
+  logger.info({ phone, text }, "Processing incoming message");
 
   const replyText = await getReply(phone, text);
 
   try {
     await sock.sendMessage(remoteJid, { text: replyText });
   } catch (err) {
-    logger.error({ err, remoteJid }, "Failed to send WhatsApp message");
+    logger.error({ err, remoteJid }, "Failed to send message reply");
   }
 }
 
+// Start bot process
 startBot().catch((err) => {
-  logger.error(err, "Fatal error starting bot");
+  logger.error(err, "Fatal bot initialization error");
   process.exit(1);
 });
